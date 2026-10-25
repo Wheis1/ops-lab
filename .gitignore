@@ -1,0 +1,31 @@
+# ---- 系统与运行产物 ----
+*.log
+*.pid
+*.swp
+*.tmp
+*.bak
+*.tar.gz
+*.zip
+
+# ---- 密码与密钥，绝对不能提交 ----
+*.pem
+*.key
+*.crt
+.env
+.env.*
+secrets/
+id_rsa*
+
+# ---- 本地环境 ----
+.venv/
+venv/
+__pycache__/
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+node_modules/
+
+# ---- 大文件（截图放 screenshots/，单张别超 1MB）----
+*.iso
+*.img

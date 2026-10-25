@@ -1,0 +1,97 @@
+# docker-compose.yml —— Nginx + MySQL + Redis + 应用，一键拉起
+# 用法：
+#   cp .env.example .env && vi .env      # 先填密码
+#   mkdir -p data/mysql data/redis logs/nginx src
+#   cp /path/to/your-app.jar src/app.jar # 放你自己的 jar（已 gitignore）
+#   docker compose up -d
+# 注意：密码只在 .env 里，.env 已被 .gitignore 忽略，不要提交
+
+services:
+  mysql:
+    image: mysql:8.0
+    container_name: lab-mysql
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD}
+      MYSQL_DATABASE: ${MYSQL_DATABASE:-app_db}
+      MYSQL_USER: ${MYSQL_USER:-app}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD}
+      TZ: Asia/Shanghai
+    volumes:
+      - ./data/mysql:/var/lib/mysql
+      - ./conf/mysql/my.cnf:/etc/mysql/conf.d/my.cnf:ro
+      - ./backup:/backup
+    ports:
+      - "127.0.0.1:3306:3306"          # 只监听本机，不暴露公网
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-p${MYSQL_ROOT_PASSWORD}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    networks: [lab]
+
+  redis:
+    image: redis:6.2
+    container_name: lab-redis
+    restart: unless-stopped
+    command: ["redis-server", "/usr/local/etc/redis/redis.conf", "--requirepass", "${REDIS_PASSWORD}"]
+    volumes:
+      - ./conf/redis/redis.conf:/usr/local/etc/redis/redis.conf:ro
+      - ./data/redis:/data
+    ports:
+      - "127.0.0.1:6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD}", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    networks: [lab]
+
+  app:
+    image: eclipse-temurin:11-jre
+    container_name: lab-app
+    restart: unless-stopped
+    command: ["java", "-jar", "/app/app.jar"]
+    environment:
+      MYSQL_HOST: mysql
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD}
+      REDIS_HOST: redis
+      REDIS_PASSWORD: ${REDIS_PASSWORD}
+      TZ: Asia/Shanghai
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:8082:8082"
+    volumes:
+      - ./src/app.jar:/app/app.jar:ro
+      - ./logs:/app/logs
+    logging:                            # 必须限制日志，否则容器日志能把磁盘写满
+      driver: json-file
+      options:
+        max-size: "100m"
+        max-file: "3"
+    networks: [lab]
+
+  nginx:
+    image: nginx:1.24
+    container_name: lab-nginx
+    restart: unless-stopped
+    depends_on: [app]
+    ports:
+      - "80:80"
+    volumes:
+      - ./conf/nginx/app.conf:/etc/nginx/conf.d/default.conf:ro
+      - ./logs/nginx:/var/log/nginx
+    logging:
+      driver: json-file
+      options:
+        max-size: "100m"
+        max-file: "3"
+    networks: [lab]
+
+networks:
+  lab:
+    driver: bridge
