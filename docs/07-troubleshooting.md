@@ -26,53 +26,32 @@
 
 ---
 
-## 场景 1：根分区磁盘写满，应用日志报 No space left on device
+## 场景 1：分区磁盘写满，应用报 No space left on device
 
-- **环境**：CentOS 7.9，40G 系统盘，Nginx + 应用日志未切割
-- **现象**：应用报 `No space left on device`，`df` 显示 `/` 使用率 100%
+- **环境**：Ubuntu 22.04.5 / 2C4G / 用 1G loop 盘模拟生产系统盘（避免把云主机写死、SSH 登不上）
+- **现象**：`dd` 报 `No space left on device`；`df` 显示 100%、Avail 0；普通用户写不进去，root 仍能写
 - **定位过程**：
 
 ```bash
-# 1. 确认哪个分区满
-df -h
-# /dev/vda1  40G  40G  0  100%  /
-
-# 2. 找出该分区下最大的目录（不跨文件系统，排除 /proc 干扰）
-du -sh /* 2>/dev/null | sort -h | tail -n 10
-
-# 3. 找出大文件（-xdev 不跨挂载点）
-find / -xdev -type f -size +500M -exec ls -lh {} \; 2>/dev/null
-
-# 4. 有没有「已删除但被进程占用」的文件（du 看不到、df 却算）
-lsof +L1 | head
+df -h /mnt/data                 # /dev/loop3  974M  901M  6.2M  100%
+du -xsh /mnt/data/* | sort -h   # 907M  /mnt/data/app.log
+ls -lah /mnt/data               # -rw-rw-r-- 1 ops ops 907M app.log
+lsof +L1                        # 找到持有句柄的进程
 ```
 
-- **根因**：应用日志按天写但没做切割，`app.log` 涨到 20G；另外有一个被 delete 但被 java 进程持有的日志文件仍占 5G
-- **修复**：
+- **根因**：应用日志只追加、不切割，`app.log` 涨到 907M 写满分区
+- **修复**：`truncate -s 0` 清空 → 配 logrotate 按天切割、保留 7 份、压缩
+- **验证**：`df` 回落到 1%；`logrotate -f` 后生成 `app.log-20261028.gz`，原文件归零
+- **复盘**：
+  - ext4 默认给 root 保留 5%（本机 `Reserved block count: 13107` ≈ 52MB），所以 100% 时 root 还能写、普通用户先报错 —— 复现故障要用业务账号
+  - `rm` 后空间不释放：进程持有 fd，`lsof +L1` 能看到 `209715200 ... (deleted)`；用 `: > /proc/<PID>/fd/<FD>` 原地清空，进程无需重启
 
-```bash
-# 清理旧日志（先确认再删）
-find /var/log/app -name "*.log.*" -mtime +7 -print
-find /var/log/app -name "*.log.*" -mtime +7 -delete
+### 复现记录（2026-10-28）
 
-# 正在写的日志不要 rm，用 truncate，避免句柄不释放
-truncate -s 0 /var/log/app/app.log
+![磁盘写满 100%](../screenshots/03-disk-full-20261028.png)
 
-# 配置 logrotate，按天切、留 7 份、压缩
-cat >/etc/logrotate.d/app <<'EOF'
-/var/log/app/*.log {
-    daily
-    rotate 7
-    compress
-    missingok
-    notifempty
-    copytruncate
-}
-EOF
-```
+![rm 后空间未释放，lsof 定位到 deleted 句柄](../screenshots/04-deleted-hold-20261028.png)
 
-- **验证**：`df -h /` 使用率降到 40% 以下；`logrotate -d /etc/logrotate.d/app` 无报错；应用恢复写入
-- **复盘**：加磁盘监控告警（80% 预警、90% 告警）；所有服务上线必须配 logrotate
 
 ---
 
@@ -219,6 +198,36 @@ pidstat -p 2317 1 5               # 观察持续占用
 
 ---
 
+## 场景 21：CentOS 上正常的脚本，搬到 Ubuntu 后「关键服务」整段空白
+
+- **环境**：Ubuntu 22.04.5 / bash 5.1 / 脚本开头 `set -uo pipefail`
+- **现象**：`check_health.sh` 在 CentOS 7 上能列出 sshd、nginx 等服务状态；在 Ubuntu 上 `[关键服务]` 后面**一行都没有**，但脚本没有报错、退出码也正常
+- **定位过程**：
+
+```bash
+# 1. 单看这段判断逻辑，服务单元确实存在
+systemctl list-unit-files | grep -c '^docker.service'    # 1
+systemctl cat docker.service >/dev/null 2>&1; echo $?    # 0
+
+# 2. 还原脚本里的写法，看退出码
+set -o pipefail
+systemctl list-unit-files | grep -q '^docker.service'
+echo $?          # 141  ← 不是 0！
+```
+
+- **根因**：`grep -q` 命中第一条就立即退出并关闭管道；`systemctl` 后续还想写入 stdout，收到 **SIGPIPE**（退出码 141）。`set -o pipefail` 会把管道里任意一个非 0 退出码当成整条管道失败，于是 `if ... ; then` 被判成假，循环一次都不执行。CentOS 上单元少、输出短，写进 64K 管道缓冲区就结束了，不会触发 SIGPIPE，所以「在 CentOS 上是好的」。
+- **修复**：不要用 `命令 | grep -q` 做判断，改成直接判断单元是否存在：
+
+```bash
+if systemctl cat "${unit}.service" >/dev/null 2>&1; then ... fi
+```
+
+其他可选写法：`grep -c ... >/dev/null`（读完整个输入，不提前退出）、管道后加 `|| true`、或临时 `set +o pipefail`。
+- **验证**：重跑脚本，`[关键服务]` 正常输出 `ssh active`、`docker active`；`echo $?` 为 0
+- **复盘**：跨发行版移植脚本的检查清单——① 服务名（sshd/ssh、crond/cron、mysqld/mysql）② 包管理器（yum/apt）③ 配置文件路径（`/etc/sysconfig` vs `/etc/default`）④ 防火墙（firewalld vs ufw）⑤ 强制访问控制（SELinux vs AppArmor）⑥ `pipefail` 下的管道写法
+
+---
+
 ## 待补场景（本周每天补 2 个）
 
 - [ ] 7. 内存不足触发 OOM Killer（`dmesg | grep -i 'killed process'`）
@@ -235,3 +244,5 @@ pidstat -p 2317 1 5               # 观察持续占用
 - [ ] 18. K8s Pod Pending / CrashLoopBackOff（`describe`、`logs`、探针）
 - [ ] 19. 时间不同步导致证书校验/主从异常（`chronyc sources`、`timedatectl`）
 - [ ] 20. SELinux 拦截服务（`getenforce`、`ausearch -m avc`、`setsebool`）
+- [x] 21. 脚本跨发行版兼容：`set -o pipefail` + `grep -q` 触发 SIGPIPE，服务检测整段空白（CentOS 脚本搬到 Ubuntu）
+
