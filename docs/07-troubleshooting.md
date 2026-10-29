@@ -82,33 +82,45 @@ sleep 2 && ss -tlnp | grep ':8080'
 
 ---
 
-## 场景 3：Nginx 启动失败（Job for nginx.service failed）
+## 场景 3：Nginx 起不来 —— 语法错 vs 端口被占
 
-- **环境**：CentOS 7.9，Nginx 1.20
-- **现象**：`systemctl start nginx` 失败，`systemctl status nginx` 显示 `failed`
-- **定位过程**：
+- **环境**：Ubuntu 22.04.5 / Nginx 1.18.0
+- **现象**：`systemctl restart nginx` 失败，报 `Job for nginx.service failed`
+
+**故障 A：配置语法错**
 
 ```bash
-systemctl status nginx -l --no-pager
-journalctl -u nginx -n 50 --no-pager
-
-# 配置语法校验（最常查的一步）
 nginx -t
-# nginx: [emerg] unknown directive "proxy_passs" in /etc/nginx/conf.d/app.conf:12
-
-# 端口是否被别的服务占用
-ss -tlnp | grep ':80\|:443'
-
-# SELinux 是否拦截
-getenforce
-ausearch -m avc -ts recent 2>/dev/null | tail
+# nginx: [emerg] unknown directive "proxy_passs" in /etc/nginx/conf.d/lab.conf:5
+systemctl status nginx --no-pager | tail -6
+# Stopping... Deactivated successfully      ← restart 先把老进程停了
+# Failed to start                           ← 新进程起不来，服务全挂
 ```
 
-- **根因**：conf 里 `proxy_pass` 拼成了 `proxy_passs`，语法错误导致启动失败（另一种常见原因是 80 端口被 httpd 占用）
-- **修复**：修正拼写 → `nginx -t` 通过 → `systemctl restart nginx`
-- **验证**：`systemctl is-active nginx` 返回 active；`curl -I http://127.0.0.1` 返回 200
-- **复盘**：改配置必须 `nginx -t` 再 reload；把 `nginx -t` 写进部署脚本
+- **根因**：`proxy_pass` 拼成了 `proxy_passs`，指令不存在
+- **修复**：改正拼写 → `nginx -t` 通过 → `systemctl restart`
+- **复盘**：生产必须 `nginx -t && systemctl reload`。`reload` 是平滑重载，配置错只拒绝加载，老 worker 继续服务；`restart` 是 stop + start，配置错等于把服务停死
 
+**故障 B：端口被占**
+
+```bash
+nginx -t          # 通过！语法没错
+systemctl restart nginx
+# bind() to 0.0.0.0:8081 failed (98: Address already in use)
+ss -tlnp | grep 8081
+# LISTEN 0 5 0.0.0.0:8081 0.0.0.0:* users:(("python3",pid=21005,fd=3))
+kill 21005 && systemctl restart nginx
+curl -I http://127.0.0.1:8081     # HTTP/1.1 200 OK, Server: nginx/1.18.0
+```
+
+- **根因**：另一个进程（python http.server）占了 8081
+- **复盘**：`nginx -t` 只检查语法，**不检查端口占用**；端口冲突要到 bind 时才暴露。注意 nginx 重试时报错会从 `Address already in use` 变成 `Unknown error`，判断看错误码 **98**
+### 复现记录（2026-10-29）
+
+![nginx -t 报语法错，restart 后服务 failed](../screenshots/05-nginx-syntax-error-20261029.png)
+
+![nginx -t 通过但 8081 被占，bind 失败](../screenshots/06-port-conflict-20261029.png)
+![kill 之后 curl -I 返回 HTTP/1.1 200 OK + Server: nginx/1.18.0，证明修好了](../screenshots/07-port-conflict-fixed-20261029.png)
 ---
 
 ## 场景 4：MySQL 登录报 ERROR 1045 (Access denied)
