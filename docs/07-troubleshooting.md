@@ -123,42 +123,63 @@ curl -I http://127.0.0.1:8081     # HTTP/1.1 200 OK, Server: nginx/1.18.0
 ![kill 之后 curl -I 返回 HTTP/1.1 200 OK + Server: nginx/1.18.0，证明修好了](../screenshots/07-port-conflict-fixed-20261029.png)
 ---
 
-## 场景 4：MySQL 登录报 ERROR 1045 (Access denied)
+## 场景 4：MySQL 无法登录（1045 / 1698）与备份恢复演练
 
-- **环境**：MySQL 8.0
-- **现象**：`mysql -uroot -p` 报 `ERROR 1045 (28000): Access denied for user 'root'@'localhost'`
-- **定位过程**：
+- **环境**：Ubuntu 22.04.5 / MySQL 8.0.46
+
+### A. root 本地能进，走 TCP 报 1698
 
 ```bash
-# 1. 先确认不是密码输错 / 不是连错实例
-mysql --version
-ss -tlnp | grep 3306
-tail -n 50 /var/log/mysqld.log
-
-# 2. 用 skip-grant-tables 临时进（仅排障，生产慎用）
-systemctl stop mysqld
-mysqld_safe --skip-grant-tables --skip-networking &
-mysql -uroot
-
-# 3. 看用户和授权主机
-SELECT user, host, plugin FROM mysql.user;
-SHOW GRANTS FOR 'root'@'localhost';
+mysql -uroot -e "select user,host,plugin from mysql.user where user='root';"
+# +------+-----------+-------------+
+# | root | localhost | auth_socket |
+mysql -uroot -h127.0.0.1 -P3306 -e "select 1;"
+# ERROR 1698 (28000): Access denied for user 'root'@'localhost'
 ```
 
-- **根因**：应用连接用的是 `root'@'%`，但授权表里只有 `root'@'localhost'`；或密码含特殊字符未加引号
-- **修复**：
+| 错误码 | 含义 | 典型场景 |
+| --- | --- | --- |
+| 1045 | 密码错 / 用户不存在 / 授权主机不匹配 | 密码打错、`root@'%'` 未授权 |
+| 1698 | 认证插件拒绝 | `auth_socket` 只认本地 socket，走 TCP 必然失败 |
+
+- **根因**：`auth_socket` 认证看的是「当前系统用户是不是 root」，只对本地 socket 有效，TCP 连接无法通过
+- **修复**：不要改 root 的认证插件，另建业务账号并只给必要权限
 
 ```sql
-FLUSH PRIVILEGES;
-ALTER USER 'root'@'localhost' IDENTIFIED WITH mysql_native_password BY '新密码';
-CREATE USER 'app'@'10.0.0.%' IDENTIFIED BY '应用密码';
-GRANT SELECT,INSERT,UPDATE,DELETE ON app_db.* TO 'app'@'10.0.0.%';
+CREATE USER 'app'@'127.0.0.1' IDENTIFIED BY 'App@12345';
+GRANT SELECT, INSERT, UPDATE, DELETE ON app_db.* TO 'app'@'127.0.0.1';
 ```
 
-改完注释掉 `skip-grant-tables` 重启，**不要长期开着**（等于无密码）
-- **验证**：`mysql -uapp -p -h 10.0.0.12 -e "select 1"` 成功
-- **复盘**：应用不用 root；密码用环境变量注入，不写死在配置里
+### B. 备份与恢复演练
 
+```bash
+mysqldump -uroot --single-transaction --routines --triggers --events app_db > /root/app_db_$(date +%F).sql
+
+mysql -uroot -N -e "select count(*) from app_db.t_user;"          # 3
+mysql -uroot -N -e "checksum table app_db.t_user;"                # app_db.t_user | 442539008
+
+mysql -uroot -e "DROP DATABASE app_db;"
+mysql -uroot -e "CREATE DATABASE app_db DEFAULT CHARSET utf8mb4;"
+mysql -uroot app_db < /root/app_db_$(date +%F).sql
+
+mysql -uroot -N -e "select count(*) from app_db.t_user;"          # 3
+mysql -uroot -N -e "checksum table app_db.t_user;"                # 442539008
+mysql -uroot -e "SHOW GRANTS FOR 'app'@'localhost';"
+```
+
+- **结果**：备份前后 `count=3`、`checksum=442539008` 完全一致；`app` 用户授权仍在
+- **关键点**：
+  - `--single-transaction` 依赖 InnoDB 快照读，备份过程不锁表
+  - 不加 `--databases` 时导出文件里没有 `CREATE DATABASE`，恢复必须指定库名
+  - `DROP DATABASE` 不会删授权（授权存在 `mysql.db`），所以库重建后应用能连但报 `Table doesn't exist`
+  - 密码写在命令行会进 shell history 和 `ps`，生产用 `mysql_config_editor` 或 `~/.my.cnf`（600 权限）
+  - 只比对行数不够，`CHECKSUM TABLE` 才能证明内容一致
+
+### 复现记录（2026-10-29）
+
+![root 走 TCP 报 1698](../screenshots/08-mysql-1698-20261029.png)
+
+![备份恢复前后 checksum 一致](../screenshots/09-mysql-backup-restore-20261029.png)
 ---
 
 ## 场景 5：Redis 报 Connection refused
