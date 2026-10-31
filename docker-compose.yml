@@ -1,97 +1,162 @@
-# docker-compose.yml —— Nginx + MySQL + Redis + 应用，一键拉起
-# 用法：
-#   cp .env.example .env && vi .env      # 先填密码
-#   mkdir -p data/mysql data/redis logs/nginx src
-#   cp /path/to/your-app.jar src/app.jar # 放你自己的 jar（已 gitignore）
-#   docker compose up -d
-# 注意：密码只在 .env 里，.env 已被 .gitignore 忽略，不要提交
-
 services:
   mysql:
     image: mysql:8.0
-    container_name: lab-mysql
+    container_name: stack-mysql
     restart: unless-stopped
     environment:
       MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD}
-      MYSQL_DATABASE: ${MYSQL_DATABASE:-app_db}
-      MYSQL_USER: ${MYSQL_USER:-app}
+      MYSQL_DATABASE: ${MYSQL_DATABASE}
+      MYSQL_USER: ${MYSQL_USER}
       MYSQL_PASSWORD: ${MYSQL_PASSWORD}
       TZ: Asia/Shanghai
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_unicode_ci
+      - --innodb-buffer-pool-size=256M
+      - --max-connections=200
+    ports:
+      - "127.0.0.1:13306:3306"
     volumes:
       - ./data/mysql:/var/lib/mysql
-      - ./conf/mysql/my.cnf:/etc/mysql/conf.d/my.cnf:ro
-      - ./backup:/backup
-    ports:
-      - "127.0.0.1:3306:3306"          # 只监听本机，不暴露公网
     healthcheck:
       test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-p${MYSQL_ROOT_PASSWORD}"]
       interval: 10s
       timeout: 5s
-      retries: 10
-    networks: [lab]
+      retries: 15
+    networks: [stack]
 
   redis:
     image: redis:6.2
-    container_name: lab-redis
+    container_name: stack-redis
     restart: unless-stopped
-    command: ["redis-server", "/usr/local/etc/redis/redis.conf", "--requirepass", "${REDIS_PASSWORD}"]
-    volumes:
-      - ./conf/redis/redis.conf:/usr/local/etc/redis/redis.conf:ro
-      - ./data/redis:/data
+    command: ["redis-server", "--requirepass", "${REDIS_PASSWORD}", "--maxmemory", "256mb", "--maxmemory-policy", "allkeys-lru"]
     ports:
-      - "127.0.0.1:6379:6379"
+      - "127.0.0.1:16379:6379"
+    volumes:
+      - ./data/redis:/data
     healthcheck:
       test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD}", "ping"]
       interval: 10s
       timeout: 3s
       retries: 5
-    networks: [lab]
+    networks: [stack]
 
   app:
-    image: eclipse-temurin:11-jre
-    container_name: lab-app
+    image: openjdk:17-jdk-slim
+    container_name: stack-app
     restart: unless-stopped
-    command: ["java", "-jar", "/app/app.jar"]
+    command: ["sh", "-c", "java -Xms256m -Xmx512m -jar /app/sky.jar --server.port=8082"]
     environment:
-      MYSQL_HOST: mysql
-      MYSQL_PASSWORD: ${MYSQL_PASSWORD}
-      REDIS_HOST: redis
-      REDIS_PASSWORD: ${REDIS_PASSWORD}
+      SPRING_DATASOURCE_URL: jdbc:mysql://mysql:3306/sky_take_out?useUnicode=true&characterEncoding=utf-8&serverTimezone=Asia/Shanghai&useSSL=false&allowPublicKeyRetrieval=true
+      SPRING_DATASOURCE_USERNAME: ${MYSQL_USER}
+      SPRING_DATASOURCE_PASSWORD: ${MYSQL_PASSWORD}
+      SPRING_REDIS_HOST: redis
+      SPRING_REDIS_PORT: "6379"
+      SPRING_REDIS_PASSWORD: ${REDIS_PASSWORD}
+      SKY_DATASOURCE_HOST: mysql
+      SKY_DATASOURCE_PORT: "3306"
+      SKY_DATASOURCE_DATABASE: sky_take_out
+      SKY_DATASOURCE_USERNAME: ${MYSQL_USER}
+      SKY_DATASOURCE_PASSWORD: ${MYSQL_PASSWORD}
+      SKY_REDIS_HOST: redis
+      SKY_REDIS_PORT: "6379"
+      SKY_REDIS_PASSWORD: ${REDIS_PASSWORD}
+      SKY_REDIS_DATABASE: "1"
       TZ: Asia/Shanghai
+    volumes:
+      - ./app/sky.jar:/app/sky.jar:ro
+      - ./logs/app:/app/logs
     depends_on:
       mysql:
         condition: service_healthy
       redis:
         condition: service_healthy
-    ports:
-      - "127.0.0.1:8082:8082"
-    volumes:
-      - ./src/app.jar:/app/app.jar:ro
-      - ./logs:/app/logs
-    logging:                            # 必须限制日志，否则容器日志能把磁盘写满
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c '</dev/tcp/127.0.0.1/8082' || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 60s
+    logging:
       driver: json-file
       options:
-        max-size: "100m"
-        max-file: "3"
-    networks: [lab]
+        max-size: "50m"
+        max-file: "2"
+    networks: [stack]
 
   nginx:
-    image: nginx:1.24
-    container_name: lab-nginx
+    image: nginx:alpine
+    container_name: stack-nginx
     restart: unless-stopped
     depends_on: [app]
     ports:
-      - "80:80"
+      - "8080:80"
     volumes:
-      - ./conf/nginx/app.conf:/etc/nginx/conf.d/default.conf:ro
+      - ./conf/app.conf:/etc/nginx/conf.d/default.conf:ro
       - ./logs/nginx:/var/log/nginx
     logging:
       driver: json-file
       options:
-        max-size: "100m"
-        max-file: "3"
-    networks: [lab]
+        max-size: "50m"
+        max-file: "2"
+    networks: [stack]
+
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: stack-prometheus
+    restart: unless-stopped
+    volumes:
+      - ./conf/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./conf/prometheus/rules:/etc/prometheus/rules:ro
+      - ./data/prometheus:/prometheus
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.retention.time=7d
+      - --web.enable-lifecycle
+    ports:
+      - "9090:9090"
+    networks: [stack]
+
+  alertmanager:
+    image: prom/alertmanager:latest
+    container_name: stack-alertmanager
+    restart: unless-stopped
+    volumes:
+      - ./conf/alertmanager/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
+    ports:
+      - "127.0.0.1:9093:9093"
+    networks: [stack]
+
+  node-exporter:
+    image: prom/node-exporter:latest
+    container_name: stack-node-exporter
+    restart: unless-stopped
+    pid: host
+    volumes:
+      - /proc:/host/proc:ro
+      - /sys:/host/sys:ro
+      - /:/rootfs:ro
+    command:
+      - --path.procfs=/host/proc
+      - --path.sysfs=/host/sys
+      - --path.rootfs=/rootfs
+    ports:
+      - "127.0.0.1:9100:9100"
+    networks: [stack]
+
+  grafana:
+    image: grafana/grafana:latest
+    container_name: stack-grafana
+    restart: unless-stopped
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    volumes:
+      - ./data/grafana:/var/lib/grafana
+    ports:
+      - "3000:3000"
+    networks: [stack]
 
 networks:
-  lab:
+  stack:
     driver: bridge

@@ -1,0 +1,20 @@
+groups:
+  - name: basic-alerts
+    rules:
+      - alert: InstanceDown
+        expr: up == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "实例 {{ $labels.instance }} 不可达"
+          description: "job={{ $labels.job }} 连续 1 分钟抓取失败"
+
+      - alert: DiskAlmostFull
+        expr: (1 - node_filesystem_avail_bytes{fstype!~"tmpfs|overlay|squashfs"} / node_filesystem_size_bytes{fstype!~"tmpfs|overlay|squashfs"}) * 100 > 85
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: '磁盘使用率 {{ printf "%.1f" $value }}%'
+          description: "挂载点 {{ $labels.mountpoint }} 超过 85%"
