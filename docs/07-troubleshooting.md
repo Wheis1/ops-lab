@@ -55,31 +55,34 @@ lsof +L1                        # 找到持有句柄的进程
 
 ---
 
-## 场景 2：启动服务提示 8080 端口已被占用
+## 场景 2：端口被占用（8080 已被容器占用）
 
-- **环境**：CentOS 7.9
-- **现象**：`java -jar app.jar` 启动失败，日志 `Address already in use: bind`
+- **环境**：Ubuntu 22.04.5 / Docker 29.9.2 / compose v5.6.1
+- **现象**：
+
+```bash
+docker run --rm -p 8080:80 nginx:alpine
+# docker: Error response from daemon: ... Bind for 0.0.0.0:8080 failed: port is already allocated
+```
+
 - **定位过程**：
 
 ```bash
-# 1. 看谁在监听 8080
 ss -tlnp | grep ':8080'
-# LISTEN 0 128 *:8080 *:* users:(("java",pid=2317,fd=98))
+# LISTEN 0 4096 0.0.0.0:8080 0.0.0.0:* users:(("docker-proxy",pid=270092,fd=8))
 
-# 2. 确认这个进程是什么
-ps -fp 2317
-ls -l /proc/2317/cwd     # 看工作目录，判断是哪个应用
-
-# 3. 如果是自己上一次没退干净的进程，杀掉；如果是别的业务，改端口
-kill -15 2317
-sleep 2 && ss -tlnp | grep ':8080'
+docker ps --format 'table {{.Names}}\t{{.Ports}}'
+# stack-nginx   0.0.0.0:8080->80/tcp, [::]:8080->80/tcp
 ```
 
-- **根因**：旧的 jar 进程没有正常退出（kill -9 之后父进程重新拉起），新实例抢不到端口
-- **修复**：`systemctl stop app` 停干净 → 确认端口释放 → 再启动；部署脚本里加「启动前检测端口」逻辑（见 `scripts/deploy.sh`）
-- **验证**：`ss -tlnp | grep 8080` 只有一个 PID，且是新启动的；`curl -I http://127.0.0.1:8080` 返回 200
-- **复盘**：部署脚本必须做端口占用检查，不能盲目启动
+- **根因**：8080 已被 `stack-nginx` 的端口映射占用。`ss` 里看到的是 **docker-proxy** 而不是 nginx 进程——这是判断"端口被容器占用"的关键线索
+- **修复**：换端口（`-p 8081:80`），或停掉占用者（`docker compose stop nginx`）
+- **验证**：`ss -tlnp | grep 8080` 无输出，或新端口 `curl -I` 返回 200
+- **复盘**：宿主机 nginx（systemd）和容器 nginx 会争同一端口，两者版本号不同（`Server: nginx/1.18.0` vs `1.21.5`），**看响应头就能区分请求落到谁身上**
 
+### 复现记录（2026-10-31）
+
+![docker 端口冲突与 ss 定位](../screenshots/10-docker-port-conflict-20261031.png)
 ---
 
 ## 场景 3：Nginx 起不来 —— 语法错 vs 端口被占
@@ -230,6 +233,31 @@ pidstat -p 2317 1 5               # 观察持续占用
 - **复盘**：加重试上限与熔断；CPU 告警阈值分级
 
 ---
+## 场景 13：Nginx 502 —— 上游容器被停
+
+- **环境**：容器 nginx:alpine → app:8082
+- **现象**：`curl -i http://127.0.0.1:8080/` 返回 `HTTP/1.1 502 Bad Gateway`，`Server: nginx/1.21.5`
+- **定位过程**：
+
+```bash
+docker compose ps                  # app 不在列表 → 上游不存在
+tail -5 logs/nginx/error.log
+# connect() failed (113: Host is unreachable) while connecting to upstream,
+#   upstream: "http://172.18.0.4:8082/"
+```
+
+- **根因**：`docker compose stop app` 后容器 IP 从 bridge 网络消失，nginx 连接时目标不可达
+- **修复**：`docker compose start app`，等健康检查通过
+- **验证**：`curl` 返回应用的 404/200（不再是 nginx 的 HTML 502），日志不再报错
+- **复盘**：
+  - **113 Host is unreachable** = 容器不存在（IP 消失）；**111 Connection refused** = 容器在、进程没监听
+  - 502 的排查顺序：看 error.log 里的 upstream 地址 → 查那个服务是否存活 → 查端口/网络
+  - 挂载 `/var/log/nginx` 会覆盖镜像指向 stdout 的软链接，`docker logs nginx` 看不到访问日志，必须 `tail` 文件
+### 复现记录（2026-10-31）
+
+![Nginx 502 与 error.log 的 113](../screenshots/11-nginx-502-113-20261031.png)
+
+---
 
 ## 场景 21：CentOS 上正常的脚本，搬到 Ubuntu 后「关键服务」整段空白
 
@@ -269,7 +297,6 @@ if systemctl cat "${unit}.service" >/dev/null 2>&1; then ... fi
 - [ ] 10. 忘记 root 密码（GRUB 单用户模式重置）
 - [ ] 11. inode 用尽（`df -i`，大量小文件）
 - [ ] 12. crontab 定时任务不执行（路径 / 权限 / 环境变量 / crond 状态）
-- [ ] 13. Nginx 502 与 504 的区别与定位
 - [ ] 14. MySQL 连接数打满（`show processlist`、`max_connections`）
 - [ ] 15. MySQL 主从延迟（`Seconds_Behind_Master`、大事务、从库压力）
 - [ ] 16. 容器启动即退出（`docker logs`、退出码、启动命令）

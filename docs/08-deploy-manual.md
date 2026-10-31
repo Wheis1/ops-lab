@@ -1,7 +1,7 @@
-# 08 · 部署实施手册（模板 + 示例）
+# 08 · 部署实施手册（Linux + Docker Compose 四容器）
 
-> 这是交给「客户/下一任运维」看的东西，标准是：**别人照着做，不用问你也能部署成功**。
-> 下面的示例是 LNMP + Docker Compose 场景，把路径、IP、账号换成你自己的即可。
+> 本文档基于 2026-10-30 的真实部署过程整理，所有命令均可复现。
+> 目标：别人照着做，不用问作者也能上线成功。
 
 ---
 
@@ -9,108 +9,195 @@
 
 | 项目 | 内容 |
 | --- | --- |
-| 系统 | CentOS 7.9 x86_64 |
-| 配置 | 2C4G / 40G 系统盘 |
-| 依赖 | JDK 11、MySQL 8.0、Redis 6.2、Nginx 1.20、Docker 24 + Compose v2 |
-| 网络 | 内网 10.0.0.0/24，对外仅开放 80/443，管理走跳板机 |
-| 部署方式 | Docker Compose 一键编排（4 个容器） |
+| 应用 | sky-server（Spring Boot 2.7.3，JAR 74MB） |
+| 主机 | 阿里云 ECS，Ubuntu 22.04.5 LTS，2 vCPU / 4 GiB / 40 GiB ESSD |
+| 运行时 | Docker 29.9.2 + Docker Compose v5.6.1 |
+| 镜像 | `openjdk:17-jdk-slim`、`mysql:8.0`、`redis:6.2`、`nginx:alpine` |
+| 编排 | 单机 4 容器，bridge 网络 `stack` |
+| 公网入口 | `http://<公网IP>:8080` → 容器 nginx:80 → app:8082 |
 
-## 2. 前置检查（部署前 5 分钟）
+## 2. 端口规划
+
+| 宿主机 | 容器 | 服务 | 说明 |
+| --- | --- | --- | --- |
+| 8080 | 80 | nginx | 唯一对外入口 |
+| 13306 | 3306 | mysql | **只绑 127.0.0.1**，不暴露公网 |
+| 16379 | 6379 | redis | **只绑 127.0.0.1** |
+| — | 8082 | app | 不出宿主机，仅容器网络内可达 |
+
+> 应用容器**不映射宿主机端口**，所有流量必须经 nginx 进入。对外只暴露一个口，攻击面最小。
+
+## 3. 目录结构
+
+```
+/opt/app/stack/
+├── docker-compose.yml
+├── .env                  # 密码，权限 600，不进 Git
+├── Dockerfile            # 可选：自建 JRE 基础镜像
+├── app/
+│   ├── sky.jar           # 应用包，挂载进容器
+│   └── lost.jar
+├── sql/                  # 初始化 SQL
+├── conf/app.conf         # nginx 反代配置
+├── data/mysql/           # MySQL 数据（bind mount，重启不丢）
+├── data/redis/
+└── logs/nginx/           # 注意：挂载后 docker logs 看不到访问日志
+```
+
+## 4. 前置检查（部署前 5 分钟）
 
 ```bash
-# 系统版本与内核
-cat /etc/redhat-release && uname -r
+# 系统与资源
+cat /etc/os-release | head -2
+df -h / && free -h
 
-# 磁盘与内存（至少留 20% 空闲）
-df -h && free -h
-
-# 端口是否被占用（80/443/3306/6379/8082/8080）
-ss -tlnp | grep -E ':(80|443|3306|6379|8082|8080)\b'
-
-# 时间是否同步（不同步会导致证书/SQL 时间错乱）
-timedatectl
-
-# SELinux 与防火墙状态（决定后面要不要放行）
-getenforce && systemctl is-active firewalld
-
-# Docker 是否可用
+# Docker 可用性
 docker version && docker compose version
+
+# 端口占用（8080/13306/16379 都应无输出）
+ss -tlnp | grep -E ':(8080|13306|16379)\b'
+
+# 镜像加速是否生效
+docker info | grep -A2 'Registry Mirrors'
+
+# 确认目录
+ls -lh app/ sql/ conf/
 ```
 
-## 3. 部署步骤
+## 5. 部署步骤
+
+### 5.1 准备环境变量
 
 ```bash
-# 3.1 建目录与用户（不用 root 跑应用）
-useradd -r -s /sbin/nologin appuser
-mkdir -p /opt/app/{conf,logs,data,backup}
-
-# 3.2 拉取代码
-cd /opt/app
-git clone <仓库地址> src && cd src
-
-# 3.3 准备环境变量（密码不写进 compose 文件）
-cp .env.example .env
-vi .env      # 填 MYSQL_ROOT_PASSWORD / MYSQL_PASSWORD / REDIS_PASSWORD
-
-# 3.4 导入数据库（首次部署）
-docker compose up -d mysql
-sleep 20
-docker compose exec -T mysql mysql -uroot -p"$MYSQL_ROOT_PASSWORD" < init.sql
-
-# 3.5 拉起全部服务
-docker compose up -d
-docker compose ps          # 4 个容器都应为 running/healthy
-
-# 3.6 配置 Nginx 路径分流（单机双项目）
-nginx -t && nginx -s reload
+cd /opt/app/stack
+cat > .env <<'EOF'
+MYSQL_ROOT_PASSWORD=Root@12345
+MYSQL_DATABASE=sky_take_out
+MYSQL_USER=app
+MYSQL_PASSWORD=App@12345
+REDIS_PASSWORD=Redis@12345
+EOF
+chmod 600 .env
 ```
 
-## 4. 验证清单（缺一项都不算部署完成）
+### 5.2 先起依赖（MySQL / Redis）
+
+```bash
+docker compose up -d mysql redis
+docker compose ps          # 等两个都变成 (healthy)
+```
+
+MySQL 首次初始化需要 30–60 秒，**必须等 healthy 再导数据**，否则导入会失败。
+
+### 5.3 导入初始化 SQL
+
+```bash
+docker compose exec -T mysql mysql -uroot -p'Root@12345' sky_take_out < sql/sky.sql
+
+# 校验表数量（应为 11）
+docker compose exec -T mysql mysql -uroot -p'Root@12345' -N \
+  -e "select count(*) from information_schema.tables where table_schema='sky_take_out';"
+```
+
+### 5.4 起应用容器
+
+```bash
+docker compose up -d app
+docker compose logs -f app --tail=40
+```
+
+成功标志：
+
+```
+Tomcat started on port(s): 8082 (http)
+Started SkyApplication in 8.392 seconds
+```
+
+本项目用**自定义配置前缀**（`sky.datasource.*`、`sky.redis.*`），必须用对应前缀的环境变量覆盖，写 `SPRING_DATASOURCE_URL` 是无效的：
+
+```yaml
+SKY_DATASOURCE_HOST: mysql
+SKY_DATASOURCE_PORT: "3306"
+SKY_DATASOURCE_DATABASE: sky_take_out
+SKY_DATASOURCE_USERNAME: ${MYSQL_USER}
+SKY_DATASOURCE_PASSWORD: ${MYSQL_PASSWORD}
+SKY_REDIS_HOST: redis
+SKY_REDIS_PORT: "6379"
+SKY_REDIS_PASSWORD: ${REDIS_PASSWORD}
+```
+
+> 判断是否生效：看启动日志里 Druid 打印的 `url:`，如果还是 `localhost:3306`，说明覆盖没进来。
+
+### 5.5 起入口（Nginx）
+
+```bash
+docker compose up -d nginx
+docker compose ps           # 4 个容器全部 Up
+```
+
+## 6. 验证清单（缺一项都不算部署完成）
 
 | # | 检查项 | 命令 | 期望结果 |
 | --- | --- | --- | --- |
-| 1 | 容器状态 | `docker compose ps` | 全部 Up / healthy |
-| 2 | 应用端口 | `ss -tlnp \| grep 8082` | 有监听 |
-| 3 | 首页 | `curl -I http://127.0.0.1:8082/lost/` | HTTP 200 |
-| 4 | 反向代理 | `curl -I http://127.0.0.1/lost/` | HTTP 200，Header 有 upstream |
-| 5 | 数据库连通 | `docker compose exec mysql mysqladmin ping` | `mysqld is alive` |
-| 6 | 缓存连通 | `redis-cli -a "$REDIS_PASSWORD" ping` | `PONG` |
-| 7 | 监控指标 | `curl -s http://127.0.0.1:9100/metrics \| head` | 有指标输出 |
-| 8 | 日志无 ERROR | `docker compose logs --tail 100 app \| grep ERROR` | 无输出 |
-| 9 | 重启自愈 | `docker compose restart app` 后再验证第 3 项 | 200 |
+| 1 | 容器状态 | `docker compose ps` | 4 个 Up，mysql/redis/app 为 healthy |
+| 2 | 入口存活 | `curl -i http://127.0.0.1:8080/` | `Server: nginx/1.21.5`，返回应用 JSON 404 |
+| 3 | 反代链路 | 同上 | 响应体是 Spring Boot 的 JSON（不是 nginx 的 HTML 502） |
+| 4 | 业务登录 | `curl -s -X POST .../admin/employee/login -d '{"username":"admin","password":"123456"}'` | `"code":1` 且返回 `token` |
+| 5 | 数据库连通 | `select count(*) from employee;` | 有数据（1 行） |
+| 6 | 缓存连通 | `docker compose exec redis redis-cli -a 'Redis@12345' ping` | `PONG` |
+| 7 | 容器间解析 | `docker compose exec nginx getent hosts app` | 返回 `172.x.x.x  app` |
+| 8 | 数据持久化 | `docker compose down && up -d` 后查表 | 数据仍在 |
+| 9 | 故障隔离 | `docker compose stop app` 后 `curl` | 返回 502，恢复后正常 |
+### 验证截图（2026-10-31）
 
-## 5. 回滚方案
+![登录接口返回 token](../screenshots/12-login-token-20261031.png)
+
+## 7. 数据持久化与备份
+
+- MySQL 数据在 `./data/mysql`（bind mount），`docker compose down` **不会删数据**
+- 危险操作是 `docker compose down -v`：`-v` 会删命名卷（本次是 bind mount，不受影响，但别养成习惯）
+- 备份：
 
 ```bash
-# 5.1 部署前必须备份（脚本已包含）
-bash scripts/backup_mysql.sh
-
-# 5.2 回滚到上一个镜像 tag
-docker compose down
-docker tag app:previous app:latest
-docker compose up -d
-
-# 5.3 回滚数据库（谨慎：会覆盖当前数据）
-gunzip < backup/app_db_20261024_0300.sql.gz | docker compose exec -T mysql mysql -uroot -p"$PWD" app_db
+docker compose exec -T mysql mysqldump -uroot -p'Root@12345' \
+  --single-transaction --routines --triggers sky_take_out \
+  | gzip > backup/sky_$(date +%F).sql.gz
 ```
 
-## 6. 常见问题
+- 恢复演练必做：备份 → `DROP DATABASE` → 重建 → 导入 → `CHECKSUM TABLE` 比对
 
-| 现象 | 可能原因 | 处理 |
+## 8. 回滚与重建
+
+| 场景 | 操作 |
+| --- | --- |
+| 应用版本回滚 | 替换 `app/sky.jar` → `docker compose up -d --force-recreate app` |
+| 配置回滚 | 用备份的 `app.conf` 覆盖 → `docker compose restart nginx` |
+| 整机重建 | 重装 Docker → 拉代码 → `cp .env` → `up -d` → 导入 SQL（30 分钟内） |
+
+## 9. 常见问题
+
+| 现象 | 根因 | 处理 |
 | --- | --- | --- |
-| 容器 Up 但访问 502 | 应用没起完 / 端口写错 | `docker logs` 看启动日志，确认 `server.port` |
-| 启动报 `bind: address already in use` | 旧进程未退出 | `ss -tlnp` 找 PID，停掉再起 |
-| 数据库连不上（1045） | 密码错 / 授权主机不匹配 | 核对 `.env` 与 `mysql.user` |
-| 页面样式丢失 | Nginx 静态资源路径错 | 检查 `root` 与 `location /static` |
-| 磁盘快速上涨 | 容器日志未限制 | compose 加 `logging: max-size: 100m` |
+| `Bind for 0.0.0.0:8080 failed: port is already allocated` | 宿主机 8080 被占 | `ss -tlnp \| grep 8080`，看到 `docker-proxy` 说明是容器；`docker ps` 定位后停掉或换端口 |
+| `not found` 拉不到镜像 | 加速器未缓存该仓库 | 换等价镜像（`openjdk:17-jdk-slim`、`nginx:alpine`），或用 `ubuntu:22.04` 自建 |
+| 应用连 `localhost:3306` 报 Connection refused | 配置前缀不是 `spring.datasource` | 用 `SKY_DATASOURCE_*` 覆盖；`unzip -p jar BOOT-INF/classes/application-dev.yml` 查前缀 |
+| 502 Bad Gateway | 上游容器停了 | `docker compose ps` 看 app；`logs/nginx/error.log` 看 113/111 |
+| `docker logs nginx` 没有访问日志 | 挂载 `/var/log/nginx` 覆盖了镜像的 stdout 软链接 | 改看 `logs/nginx/access.log`，或不挂日志目录 |
+| 登录返回「密码错误」但账号存在 | 库里存明文，应用比对 MD5 | 存 `e10adc3949ba59abbe56e057f20f883e`（123456 的 MD5） |
+| 容器 healthy 但业务不可用 | 健康检查只探端口 | 改用 `/actuator/health` 或业务探针 |
 
-## 7. 附录
+## 10. 安全注意（本项目实际踩过）
 
-- 端口分配：8082（失物招领）、8080（智慧餐饮）、3306、6379、9100（node_exporter）
-- 目录：代码 `/opt/app/src`、日志 `/opt/app/logs`、备份 `/opt/app/backup`
-- 账号：应用账号 `app`，仅授权业务库，禁止 root 登录应用
-- 变更记录：每次上线在此追加一行（日期 / 内容 / 操作人 / 是否回滚）
+1. **密钥不能进 jar、不能打日志**：`application-dev.yml` 里硬编码了 OSS AccessKey 与微信 AppSecret，且启动时打印到日志 → 已做 AK 轮换，改为环境变量注入
+2. `.env` 权限 600，`.gitignore` 必须包含 `.env`、`*.jar`、`application-dev.yml`
+3. MySQL/Redis 端口只绑 `127.0.0.1`，不对公网开放
+4. 应用容器不映射宿主机端口，统一走 nginx
+5. 密码不写在命令行（会进 history 和 `ps`），生产用 `~/.my.cnf` 或 `mysql_config_editor`
 
-| 日期 | 变更内容 | 操作人 | 结果 |
+## 11. 变更记录
+
+| 日期 | 变更 | 操作人 | 结果 |
 | --- | --- | --- | --- |
-| 2026-10-24 | 首次部署 v1.0 | 王森 | 成功 |
+| 2026-10-30 | 首次部署：4 容器 + 反向代理 + 数据导入 | 王森 | 成功 |
+| 2026-10-30 | 修复密码哈希不一致（明文 → MD5） | 王森 | 登录成功 |
+| 2026-10-30 | 验证持久化：down/up 后数据保留 | 王森 | 通过 |
