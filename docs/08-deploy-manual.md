@@ -27,6 +27,25 @@
 
 > 应用容器**不映射宿主机端口**，所有流量必须经 nginx 进入。对外只暴露一个口，攻击面最小。
 
+### 2.1 网络连通性验证（实测）
+
+```bash
+# 1. 容器 DNS：服务名 → 容器 IP
+docker compose exec app getent hosts mysql redis
+# 172.18.0.2  mysql
+# 172.18.0.3  redis
+
+# 2. nginx → app：走容器网络 + 容器端口（不是宿主机端口）
+docker compose exec nginx wget -S -qO- http://app:8082/ 2>&1 | head -6
+# HTTP/1.1 404（应用无根路由，能返回 404 即证明链路通）
+
+# 3. app → mysql：容器端口 3306，与宿主机映射的 13306 无关
+docker compose exec app bash -c 'exec 3<>/dev/tcp/mysql/3306 && echo "mysql:3306 可达" && exec 3>&-'
+# mysql:3306 可达
+```
+
+**结论**：容器间通信一律用「服务名 + 容器端口」，`ports:` 映射只用于容器外部访问；容器内的 `127.0.0.1` 指向容器自身，不是宿主机。
+
 ## 3. 目录结构
 
 ```
